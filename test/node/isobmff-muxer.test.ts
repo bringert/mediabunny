@@ -559,6 +559,88 @@ test('No btrt boxes, fragmented MP4 without bitrate metadata', async () => {
 	expect(findBtrtBoxes(new Uint8Array(output.target.buffer!))).toEqual([]);
 });
 
+test('Annex B AVC resolution changes get their own sample descriptions', async () => {
+	const square = await readAnnexBVideoPackets('0.ts'); // 720x720
+	const fullHd = await readAnnexBVideoPackets('trim-buck-bunny-ffmpeg.ts'); // 1920x1080
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const videoSource = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	// Back to back: 720x720, 1920x1080, 720x720
+	let offset = 0;
+	for (const clip of [square, fullHd, square]) {
+		const start = clip.packets[0]!.timestamp;
+		for (const packet of clip.packets) {
+			await videoSource.add(
+				packet.clone({ timestamp: packet.timestamp - start + offset }),
+				{ decoderConfig: square.decoderConfig },
+			);
+		}
+		offset += clip.packets.at(-1)!.timestamp + 1 - start;
+	}
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const view = toDataView(bytes);
+
+	// The width and height of each sample description
+	const stsd = findFourCc(bytes, 'stsd');
+	const entries: number[][] = [];
+	for (let i = 0, pos = stsd + 16; i < view.getUint32(stsd + 12); i++, pos += view.getUint32(pos)) {
+		entries.push([view.getUint16(pos + 32), view.getUint16(pos + 34)]);
+	}
+	expect(entries).toEqual([[720, 720], [1920, 1080]]);
+
+	// The chunks' sample description indices, without repeats
+	const stsc = findFourCc(bytes, 'stsc');
+	const indices: number[] = [];
+	for (let i = 0; i < view.getUint32(stsc + 12); i++) {
+		const index = view.getUint32(stsc + 24 + 12 * i);
+		if (index !== indices.at(-1)) {
+			indices.push(index);
+		}
+	}
+	expect(indices).toEqual([1, 2, 1]);
+});
+
+/** The video packets of a file from its first key packet, up to its second one (if any). */
+const readAnnexBVideoPackets = async (fileName: string) => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public', fileName)),
+		formats: ALL_FORMATS,
+	});
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+		if (packet.type === 'key' && packets.length > 0) {
+			break;
+		}
+		if (packet.type === 'key' || packets.length > 0) {
+			packets.push(packet);
+		}
+	}
+
+	return { decoderConfig: (await videoTrack.getDecoderConfig())!, packets };
+};
+
+const findFourCc = (bytes: Uint8Array, fourCc: string) => {
+	const codes = [...fourCc].map(x => x.charCodeAt(0));
+	for (let i = 4; i < bytes.length - 4; i++) {
+		if (codes.every((code, j) => bytes[i + j] === code)) {
+			return i - 4; // Start of the box
+		}
+	}
+
+	throw new Error(`No ${fourCc} box`);
+};
+
 const copyVideoMp4 = async (format: Mp4OutputFormat) => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),

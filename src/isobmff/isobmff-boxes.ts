@@ -709,12 +709,23 @@ export const stbl = (trackData: IsobmffTrackData) => {
  */
 export const stsd = (trackData: IsobmffTrackData) => {
 	let sampleDescription: Box;
+	let extraSampleDescriptions: Box[] = [];
 
 	if (trackData.type === 'video') {
-		sampleDescription = videoSampleDescription(
-			videoCodecToBoxName(trackData.track.source._codec, trackData.info.decoderConfig.codec),
-			trackData,
-		);
+		const compressionType = videoCodecToBoxName(trackData.track.source._codec, trackData.info.decoderConfig.codec);
+		sampleDescription = videoSampleDescription(compressionType, trackData);
+		extraSampleDescriptions = trackData.info.extraSampleDescriptions.map(x => videoSampleDescription(
+			compressionType,
+			{
+				...trackData,
+				info: {
+					...trackData.info,
+					width: x.width,
+					height: x.height,
+					decoderConfig: { ...trackData.info.decoderConfig, description: x.description },
+				},
+			},
+		));
 	} else if (trackData.type === 'audio') {
 		const boxName = audioCodecToBoxName(
 			trackData.track.source._codec,
@@ -737,9 +748,10 @@ export const stsd = (trackData: IsobmffTrackData) => {
 	assert(sampleDescription!);
 
 	return fullBox('stsd', 0, 0, [
-		u32(1), // Entry count
+		u32(1 + extraSampleDescriptions.length), // Entry count
 	], [
 		sampleDescription,
+		...extraSampleDescriptions,
 	]);
 };
 
@@ -1259,7 +1271,7 @@ export const stsc = (trackData: IsobmffTrackData) => {
 		trackData.compactlyCodedChunkTable.map(x => [ // Sample-to-chunk table
 			u32(x.firstChunk), // First chunk
 			u32(x.samplesPerChunk), // Samples per chunk
-			u32(1), // Sample description index
+			u32(x.sampleDescriptionIndex), // Sample description index
 		]),
 	]);
 };
