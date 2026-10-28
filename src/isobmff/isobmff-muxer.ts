@@ -47,6 +47,7 @@ import {
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
 	iterateNalUnitsInAnnexB,
+	parseAvcSps,
 	parseOpusTocByte,
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
@@ -98,6 +99,7 @@ export type IsobmffTrackData = {
 	compactlyCodedChunkTable: {
 		firstChunk: number;
 		samplesPerChunk: number;
+		sampleDescriptionIndex: number;
 	}[];
 	closed: boolean;
 
@@ -119,6 +121,16 @@ export type IsobmffTrackData = {
 		 */
 		requiresAnnexBTransformation: boolean;
 		hasAlphaChannel: boolean;
+		/**
+		 * Sample descriptions after the first one, added when the SPS of Annex B AVC input changes mid-stream in a way
+		 * that requires reconfiguring the decoder, e.g. on a resolution change. Players that only read the sample
+		 * description (like Apple's) need one per configuration.
+		 */
+		extraSampleDescriptions: { width: number; height: number; description: Uint8Array }[];
+		/** Identifies the decoder configuration of each sample description, in order */
+		sampleDescriptionKeys: string[];
+		/** 1-based index of the sample description that new samples use */
+		currentSampleDescriptionIndex: number;
 	};
 } | {
 	track: OutputAudioTrack;
@@ -496,6 +508,9 @@ export class IsobmffMuxer extends Muxer {
 				decoderConfig: decoderConfig,
 				requiresAnnexBTransformation,
 				hasAlphaChannel,
+				extraSampleDescriptions: [],
+				sampleDescriptionKeys: [],
+				currentSampleDescriptionIndex: 1,
 			},
 			timescale,
 			samples: [],
@@ -696,6 +711,16 @@ export class IsobmffMuxer extends Muxer {
 					);
 				}
 
+				// The moov box space reserved up front with fastStart: 'reserve' assumes one sample description
+				if (
+					packet.type === 'key'
+					&& trackData.track.source._codec === 'avc'
+					&& !this.isFragmented
+					&& this.fastStart !== 'reserve'
+				) {
+					await this.updateAvcSampleDescription(trackData, packetData);
+				}
+
 				// We don't strip things like SPS or PPS NALUs here, mainly because they can also appear in the middle
 				// of a stream and potentially modify the parameters of it. So, let's just leave them in to be sure.
 				packetData = concatNalUnitsInLengthPrefixed(nalUnits, 4);
@@ -718,6 +743,55 @@ export class IsobmffMuxer extends Muxer {
 			await this.registerSample(trackData, internalSample);
 		} finally {
 			release();
+		}
+	}
+
+	/**
+	 * Switches the track to the sample description matching the parameter sets in an Annex B key packet, adding a new
+	 * one if they changed.
+	 */
+	private async updateAvcSampleDescription(trackData: IsobmffVideoTrackData, packetData: Uint8Array) {
+		const record = extractAvcDecoderConfigurationRecord(packetData);
+		const spsInfo = record && parseAvcSps(record.sequenceParameterSets[0]!);
+		if (!spsInfo) {
+			// The packet doesn't carry parameter sets, so they haven't changed
+			return;
+		}
+
+		// Only changes that require reconfiguring the decoder count. Encoders may rewrite other SPS fields at any key
+		// frame (e.g. the HRD bitrate as rate control adapts), and the in-band parameter sets already cover those.
+		const key = [
+			spsInfo.profileIdc,
+			spsInfo.levelIdc,
+			spsInfo.chromaFormatIdc,
+			spsInfo.bitDepthLumaMinus8,
+			spsInfo.bitDepthChromaMinus8,
+			spsInfo.frameMbsOnlyFlag,
+			spsInfo.codedWidth,
+			spsInfo.codedHeight,
+			spsInfo.displayWidth,
+			spsInfo.displayHeight,
+		].join();
+
+		const info = trackData.info;
+		let index = info.sampleDescriptionKeys.indexOf(key) + 1;
+		if (index === 0) {
+			index = info.sampleDescriptionKeys.push(key);
+			// The first sample description was already built from the first key packet
+			if (index > 1) {
+				info.extraSampleDescriptions.push({
+					width: spsInfo.displayWidth,
+					height: spsInfo.displayHeight,
+					description: serializeAvcDecoderConfigurationRecord(record),
+				});
+			}
+		}
+
+		if (index !== info.currentSampleDescriptionIndex) {
+			// The samples of a chunk share a sample description, so the next sample starts a new chunk
+			await this.finalizeCurrentChunk(trackData);
+			trackData.currentChunk = null;
+			info.currentSampleDescriptionIndex = index;
 		}
 	}
 
@@ -1255,13 +1329,17 @@ export class IsobmffMuxer extends Muxer {
 				.reduce((acc, sample) => acc + intoTimescale(sample.duration, trackData.timescale), 0);
 		}
 
+		const sampleDescriptionIndex = trackData.type === 'video' ? trackData.info.currentSampleDescriptionIndex : 1;
+
 		if (
 			trackData.compactlyCodedChunkTable.length === 0
 			|| last(trackData.compactlyCodedChunkTable)!.samplesPerChunk !== sampleCount
+			|| last(trackData.compactlyCodedChunkTable)!.sampleDescriptionIndex !== sampleDescriptionIndex
 		) {
 			trackData.compactlyCodedChunkTable.push({
 				firstChunk: trackData.finalizedChunks.length, // 1-indexed
 				samplesPerChunk: sampleCount,
+				sampleDescriptionIndex,
 			});
 		}
 
