@@ -560,8 +560,8 @@ test('No btrt boxes, fragmented MP4 without bitrate metadata', async () => {
 });
 
 test('Annex B AVC resolution changes get their own sample descriptions', async () => {
-	const square = await readAnnexBVideoPackets('0.ts'); // 720x720
-	const fullHd = await readAnnexBVideoPackets('trim-buck-bunny-ffmpeg.ts'); // 1920x1080
+	const square = await readVideoPackets('0.ts'); // 720x720
+	const fullHd = await readVideoPackets('trim-buck-bunny-ffmpeg.ts'); // 1920x1080
 
 	const output = new Output({
 		format: new Mp4OutputFormat(),
@@ -585,18 +585,55 @@ test('Annex B AVC resolution changes get their own sample descriptions', async (
 	}
 	await output.finalize();
 
-	const bytes = new Uint8Array(output.target.buffer!);
+	expect(readSampleDescriptions(new Uint8Array(output.target.buffer!))).toEqual({
+		sizes: [[720, 720], [1920, 1080]],
+		indices: [1, 2, 1],
+	});
+});
+
+test('AVC decoder config changes get their own sample descriptions', async () => {
+	const wide = await readVideoPackets('demo.mp4'); // 640x360
+	const otherWide = await readVideoPackets('fragments-without-keyframes.mp4'); // 640x360, other SPS/PPS
+	const large = await readVideoPackets('edts.mp4'); // 854x480
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const videoSource = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	// Back to back, like a replaced encoder each time, with the decoder config of each clip on its key packet
+	let offset = 0;
+	for (const clip of [wide, otherWide, large, wide]) {
+		const start = clip.packets[0]!.timestamp;
+		for (const packet of clip.packets) {
+			await videoSource.add(
+				packet.clone({ timestamp: packet.timestamp - start + offset }),
+				packet.type === 'key' ? { decoderConfig: clip.decoderConfig } : undefined,
+			);
+		}
+		offset += clip.packets.at(-1)!.timestamp + 1 - start;
+	}
+	await output.finalize();
+
+	expect(readSampleDescriptions(new Uint8Array(output.target.buffer!))).toEqual({
+		sizes: [[640, 360], [640, 360], [854, 480]],
+		indices: [1, 2, 3, 1],
+	});
+});
+
+/** The size of each video sample description, and the chunks' sample description indices without repeats. */
+const readSampleDescriptions = (bytes: Uint8Array) => {
 	const view = toDataView(bytes);
 
-	// The width and height of each sample description
 	const stsd = findFourCc(bytes, 'stsd');
-	const entries: number[][] = [];
+	const sizes: number[][] = [];
 	for (let i = 0, pos = stsd + 16; i < view.getUint32(stsd + 12); i++, pos += view.getUint32(pos)) {
-		entries.push([view.getUint16(pos + 32), view.getUint16(pos + 34)]);
+		sizes.push([view.getUint16(pos + 32), view.getUint16(pos + 34)]);
 	}
-	expect(entries).toEqual([[720, 720], [1920, 1080]]);
 
-	// The chunks' sample description indices, without repeats
 	const stsc = findFourCc(bytes, 'stsc');
 	const indices: number[] = [];
 	for (let i = 0; i < view.getUint32(stsc + 12); i++) {
@@ -605,11 +642,12 @@ test('Annex B AVC resolution changes get their own sample descriptions', async (
 			indices.push(index);
 		}
 	}
-	expect(indices).toEqual([1, 2, 1]);
-});
+
+	return { sizes, indices };
+};
 
 /** The video packets of a file from its first key packet, up to its second one (if any). */
-const readAnnexBVideoPackets = async (fileName: string) => {
+const readVideoPackets = async (fileName: string) => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public', fileName)),
 		formats: ALL_FORMATS,

@@ -25,7 +25,15 @@ import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputSubtitleTrack, OutputTrack, OutputVideoTrack, TrackType } from '../output';
 import { Writer } from '../writer';
 import { BufferTarget } from '../target';
-import { assert, computeRationalApproximation, last, promiseWithResolvers, Rational, simplifyRational } from '../misc';
+import {
+	assert,
+	computeRationalApproximation,
+	last,
+	promiseWithResolvers,
+	Rational,
+	simplifyRational,
+	toUint8Array,
+} from '../misc';
 import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
@@ -43,7 +51,9 @@ import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHe
 import { FileSlice } from '../reader';
 import { EncodedPacket, PacketType } from '../packet';
 import {
+	AvcDecoderConfigurationRecord,
 	concatNalUnitsInLengthPrefixed,
+	deserializeAvcDecoderConfigurationRecord,
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
 	iterateNalUnitsInAnnexB,
@@ -700,6 +710,13 @@ export class IsobmffMuxer extends Muxer {
 			const trackData = this.getVideoTrackData(track, packet, meta);
 
 			let packetData = packet.data;
+
+			// The moov box space reserved up front with fastStart: 'reserve' assumes one sample description
+			const mayChangeSampleDescription = packet.type === 'key'
+				&& trackData.track.source._codec === 'avc'
+				&& !this.isFragmented
+				&& this.fastStart !== 'reserve';
+
 			if (trackData.info.requiresAnnexBTransformation) {
 				const nalUnits = [...iterateNalUnitsInAnnexB(packetData)]
 					.map(loc => packetData.subarray(loc.offset, loc.offset + loc.length));
@@ -711,19 +728,21 @@ export class IsobmffMuxer extends Muxer {
 					);
 				}
 
-				// The moov box space reserved up front with fastStart: 'reserve' assumes one sample description
-				if (
-					packet.type === 'key'
-					&& trackData.track.source._codec === 'avc'
-					&& !this.isFragmented
-					&& this.fastStart !== 'reserve'
-				) {
-					await this.updateAvcSampleDescription(trackData, packetData);
+				const record = mayChangeSampleDescription && extractAvcDecoderConfigurationRecord(packetData);
+				if (record) {
+					await this.updateAvcSampleDescription(trackData, record);
 				}
 
 				// We don't strip things like SPS or PPS NALUs here, mainly because they can also appear in the middle
 				// of a stream and potentially modify the parameters of it. So, let's just leave them in to be sure.
 				packetData = concatNalUnitsInLengthPrefixed(nalUnits, 4);
+			} else if (mayChangeSampleDescription && meta?.decoderConfig?.description) {
+				// E.g. a replaced encoder, which may emit new parameter sets with the same codec string
+				const description = toUint8Array(meta.decoderConfig.description);
+				const record = deserializeAvcDecoderConfigurationRecord(description);
+				if (record) {
+					await this.updateAvcSampleDescription(trackData, record, description);
+				}
 			}
 
 			this.validateTimestamp(
@@ -747,20 +766,24 @@ export class IsobmffMuxer extends Muxer {
 	}
 
 	/**
-	 * Switches the track to the sample description matching the parameter sets in an Annex B key packet, adding a new
-	 * one if they changed.
+	 * Switches the track to the sample description matching the parameter sets of a key packet, adding a new one if
+	 * they changed. `description` is given when the samples don't carry their parameter sets in-band.
 	 */
-	private async updateAvcSampleDescription(trackData: IsobmffVideoTrackData, packetData: Uint8Array) {
-		const record = extractAvcDecoderConfigurationRecord(packetData);
-		const spsInfo = record && parseAvcSps(record.sequenceParameterSets[0]!);
+	private async updateAvcSampleDescription(
+		trackData: IsobmffVideoTrackData,
+		record: AvcDecoderConfigurationRecord,
+		description?: Uint8Array,
+	) {
+		const spsInfo = record.sequenceParameterSets[0] && parseAvcSps(record.sequenceParameterSets[0]);
 		if (!spsInfo) {
 			// The packet doesn't carry parameter sets, so they haven't changed
 			return;
 		}
 
-		// Only changes that require reconfiguring the decoder count. Encoders may rewrite other SPS fields at any key
-		// frame (e.g. the HRD bitrate as rate control adapts), and the in-band parameter sets already cover those.
-		const key = [
+		// Without in-band parameter sets, any change needs a new sample description. With them, only changes that
+		// require reconfiguring the decoder count: encoders may rewrite other SPS fields at any key frame (e.g. the
+		// HRD bitrate as rate control adapts), and the in-band parameter sets already cover those.
+		const key = description?.join() ?? [
 			spsInfo.profileIdc,
 			spsInfo.levelIdc,
 			spsInfo.chromaFormatIdc,
@@ -782,7 +805,7 @@ export class IsobmffMuxer extends Muxer {
 				info.extraSampleDescriptions.push({
 					width: spsInfo.displayWidth,
 					height: spsInfo.displayHeight,
-					description: serializeAvcDecoderConfigurationRecord(record),
+					description: description?.slice() ?? serializeAvcDecoderConfigurationRecord(record),
 				});
 			}
 		}
